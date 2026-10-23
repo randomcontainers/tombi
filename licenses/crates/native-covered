@@ -1,0 +1,12 @@
+# ring compiles C and assembly taken from BoringSSL, which its LICENSE,
+# LICENSE-BoringSSL and LICENSE-other-bits cover, and from fiat-crypto, whose
+# license is in third_party/fiat. Its LICENSE also names the license files of
+# the once_cell code in src/polyfill. Pinned to the version that was read.
+ring@0.17.14: third_party/fiat/LICENSE
+ring@0.17.14: src/polyfill/once_cell/LICENSE-APACHE
+ring@0.17.14: src/polyfill/once_cell/LICENSE-MIT
+# These set links only so that a single version of them is linked; they
+# compile no C.
+defmt
+rayon-core
+wasm-bindgen-shared
