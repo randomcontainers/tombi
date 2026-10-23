@@ -1,0 +1,185 @@
+name: tombi
+title: Tombi
+summary: Formats and lints TOML files against JSON Schemas, with schemas for Cargo.toml and pyproject.toml built in, and runs a TOML language server.
+homepage: https://tombi-toml.github.io/tombi/
+# tombi is MIT, and most of the crates compiled into it are MIT or offer it as
+# a choice; the label takes MIT wherever a crate offers it. similar,
+# sync_wrapper, unicode-linebreak, pep440_rs, pep508_rs, ryu and self_cell
+# are taken under Apache-2.0, ring under Apache-2.0 AND ISC, rustls-webpki
+# and untrusted under ISC, subtle under BSD-3-Clause, the ICU4X crates and
+# unicode-ident under Unicode-3.0, and async-codec-lite under Apache-2.0 WITH
+# LLVM-exception AND MIT. option-ext and version-ranges are MPL-2.0, and psl
+# compiles in Mozilla's Public Suffix List, which is MPL-2.0 too although the
+# crate declares MIT or Apache-2.0; the sources of the three crates are
+# copied into the image. The crate list in the binary also names crates that
+# other members of tombi's workspace enable, such as the wasm-only gloo
+# crates and zlib-rs (Zlib), whether or not tombi compiles them. The build
+# stops when a crate in that list has a license that this label does not
+# cover. The Rust standard library and the crates it uses are linked in too:
+# MIT or a choice that includes it, with compiler-builtins also under
+# Apache-2.0 WITH LLVM-exception. The copies of the SchemaStore schemas for
+# Cargo.toml and pyproject.toml that tombi embeds come from SchemaStore,
+# which is Apache-2.0.
+license: MIT AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-3-Clause AND ISC AND Unicode-3.0 AND Zlib AND MPL-2.0
+upstream:
+  source: github-release
+  repository: tombi-toml/tombi
+  # The zed-v* tags of the Zed extension do not match.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.9.1
+  # tombi often releases several times a week, and hotfixes follow within a
+  # day or two. A release is taken once it is 48 hours old, and at most one a
+  # week.
+  cooldown: 48h
+  interval: 7d
+  # The release tag is built with its Cargo.lock, and cargo checks every crate
+  # it downloads against the checksum there.
+  git:
+    url: https://github.com/tombi-toml/tombi.git
+    tag: v{version}
+    commit: 5dcbba2f9be1355ebabea2634bc3577ed37573aa
+  extra-artifacts:
+    # The Rust release manifest, signed with the Rust release key. The build
+    # installs rustc, cargo, rust-std and rust-src from the archives it lists,
+    # each checked against the SHA-256 the manifest gives. The reconciler moves
+    # version and sha256 to each new stable release once it is 7 days old.
+    rust-toolchain:
+      version: 1.99.1
+      url: https://static.rust-lang.org/dist/channel-rust-{version}.toml
+      checksums: {url: 'https://static.rust-lang.org/dist/channel-rust-{version}.toml.sha256', algorithm: sha256}
+      signature: https://static.rust-lang.org/dist/channel-rust-{version}.toml.asc
+      sha256: fb152be80975c194aa5fc684b2aec3a6e14e2b855efe2faa4e5f8ae6e590f463
+      track:
+        source: html-index
+        url: https://static.rust-lang.org/dist/channel-rust-stable.toml
+        pattern: '^url = "https://static\.rust-lang\.org/dist/(?P<date>\d{4}-\d{2}-\d{2})/rustc-(?P<version>\d+\.\d+\.\d+)-x86_64-unknown-linux-gnu\.tar\.gz"$'
+        versioning: semver
+        cooldown: 7d
+        skip: []
+    # Built from its crate and used only in the build stage. It stores the
+    # list of crates in the tombi binary, where SBOM tools and image scanners
+    # read it. Update version and sha256 together, with the checksum from the
+    # crates.io index.
+    cargo-auditable:
+      version: 0.7.7
+      url: https://static.crates.io/crates/cargo-auditable/cargo-auditable-{version}.crate
+      sha256: ccdd489bc94d1338cd04389a842e00661300331ec915fb376b4810ef7d480b5d
+image:
+  # tombi needs a subcommand; without one it prints an error.
+  entrypoint: [tombi]
+  cmd: [--help]
+test:
+  - |
+    tombi --version > version.txt
+    case "$(cat version.txt)" in
+      "tombi $VERSION ("*"-unknown-linux-"*")") ;;
+      *) echo "expected 'tombi $VERSION (<target>)', got '$(cat version.txt)'" >&2; exit 1 ;;
+    esac
+  - |
+    # tombi is linked against the C library of the image it was built in, and
+    # its .dep-v0 section lists the crates it was built from. GNU ld puts the
+    # build ID right before the loader's path and tr may keep its last byte,
+    # so the path is matched anywhere in a word.
+    head -c 4096 /usr/local/bin/tombi | LC_ALL=C tr -c 'A-Za-z0-9_./-' '\n' | grep -oE '/lib(64)?/ld-[A-Za-z0-9_.-]+' > loader.txt \
+      || { echo "tombi names no dynamic loader" >&2; exit 1; }
+    loader=$(head -n 1 loader.txt)
+    test -e "$loader" || { echo "tombi needs $loader, which is not in the image" >&2; exit 1; }
+    LC_ALL=C grep -Fq .dep-v0 /usr/local/bin/tombi || { echo "tombi has no .dep-v0 section" >&2; exit 1; }
+  - |
+    # format --check reports a file without changing it; format rewrites it.
+    mkdir fmt
+    cd fmt || exit 1
+    printf 'a=1\n[b]\nc  =  "x"\n' > f.toml
+    cp f.toml orig.toml
+    status=0
+    tombi format --offline --check f.toml 2> check.txt || status=$?
+    test "$status" = 1 || { echo "expected exit status 1 from format --check, got $status" >&2; cat check.txt >&2; exit 1; }
+    cmp orig.toml f.toml || { echo "format --check changed f.toml" >&2; exit 1; }
+    tombi format --offline f.toml
+    printf 'a = 1\n\n[b]\nc = "x"\n' > want.toml
+    cmp want.toml f.toml || { echo "f.toml was not formatted as expected, got:" >&2; cat f.toml >&2; exit 1; }
+    tombi format --offline --check f.toml
+    # Standard input to standard output.
+    printf 'array=[1,2,3]\n' | tombi format --offline - > stdin.toml
+    printf 'array = [1, 2, 3]\n' > want-stdin.toml
+    cmp want-stdin.toml stdin.toml || { echo "stdin was not formatted as expected, got:" >&2; cat stdin.toml >&2; exit 1; }
+  - |
+    # The Cargo.toml schema is built in: with --offline the formatter still
+    # sorts dependencies and orders tables and inline tables by it.
+    mkdir cargo
+    cd cargo || exit 1
+    printf '[features]\ndefault = ["clap"]\nclap = ["clap/derive"]\n\n[dependencies]\nserde = { features = ["derive"], version = "^1.0.0" }\nclap = { version = "4.5.0" }\n' > Cargo.toml
+    tombi format --offline Cargo.toml
+    printf '[dependencies]\nclap = { version = "4.5.0" }\nserde = { version = "^1.0.0", features = ["derive"] }\n\n[features]\ndefault = ["clap"]\nclap = ["clap/derive"]\n' > want.toml
+    cmp want.toml Cargo.toml || { echo "Cargo.toml was not formatted as expected, got:" >&2; cat Cargo.toml >&2; exit 1; }
+  - |
+    # lint reports TOML errors and schema violations as JSON Lines. The
+    # second file selects the built-in Cargo.toml schema with a comment.
+    mkdir lint
+    cd lint || exit 1
+    printf 'a = 1\na = 2\n' > dup.toml
+    printf '#:schema tombi://www.schemastore.org/cargo.json\n\n[package]\nname = 1\n' > manifest.toml
+    # check FILE CODE: lint fails on FILE with a diagnostic of CODE.
+    check() {
+      status=0
+      tombi lint --offline --diagnostics-format json-lines --diagnostics-file "$1.jsonl" "$1" 2> "$1.err" || status=$?
+      test "$status" = 1 || { echo "expected exit status 1 from lint $1, got $status" >&2; cat "$1.err" >&2; exit 1; }
+      grep -F "\"path\":\"$1\"" "$1.jsonl" | grep -Fq "\"code\":\"$2\"" \
+        || { echo "expected $2 for $1, got:" >&2; cat "$1.jsonl" "$1.err" >&2; exit 1; }
+    }
+    check dup.toml duplicate-key
+    check manifest.toml type-mismatch
+    printf 'a = 1\nb = 2\n' > ok.toml
+    tombi lint --offline ok.toml
+  - |
+    # A schema of your own, named in tombi.toml.
+    mkdir schema
+    cd schema || exit 1
+    printf '{"type": "object", "properties": {"port": {"type": "integer"}}, "required": ["port"]}\n' > port.json
+    printf '[[schemas]]\npath = "port.json"\ninclude = ["conf.toml"]\n' > tombi.toml
+    printf 'port = 8080\n' > conf.toml
+    tombi lint --offline conf.toml
+    printf 'port = "8080"\n' > conf.toml
+    status=0
+    tombi lint --offline --diagnostics-format json-lines --diagnostics-file conf.jsonl conf.toml 2> conf.err || status=$?
+    test "$status" = 1 || { echo "expected exit status 1, got $status" >&2; cat conf.err >&2; exit 1; }
+    grep -Fq '"code":"type-mismatch"' conf.jsonl || { echo "expected type-mismatch, got:" >&2; cat conf.jsonl conf.err >&2; exit 1; }
+  - |
+    # Without arguments tombi formats the project of the tombi.toml it finds,
+    # minus the files it excludes.
+    mkdir -p project/vendor project/docs
+    cd project || exit 1
+    printf '[files]\nexclude = ["vendor/**"]\n' > tombi.toml
+    printf 'x=1\n' > docs/a.toml
+    printf 'x=1\n' > vendor/b.toml
+    tombi format --offline
+    printf 'x = 1\n' > want.toml
+    cmp want.toml docs/a.toml || { echo "docs/a.toml was not formatted, got:" >&2; cat docs/a.toml >&2; exit 1; }
+    printf 'x=1\n' > want-vendor.toml
+    cmp want-vendor.toml vendor/b.toml || { echo "vendor/b.toml was formatted although it is excluded" >&2; exit 1; }
+    tombi lint --offline
+  - |
+    tombi completion bash > tombi.bash
+    grep -q '^_tombi() {' tombi.bash || { echo "no _tombi function in the bash completion:" >&2; head tombi.bash >&2; exit 1; }
+    grep -q 'complete -F _tombi ' tombi.bash || { echo "the bash completion does not register _tombi" >&2; exit 1; }
+  - |
+    # The language server answers initialize and stops when its input ends.
+    body='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}'
+    printf 'Content-Length: %s\r\n\r\n%s' "${#body}" "$body" > lsp.in
+    status=0
+    timeout 60 tombi lsp --offline < lsp.in > lsp.out 2> lsp.err || status=$?
+    test "$status" = 0 || { echo "tombi lsp exited with $status" >&2; cat lsp.err >&2; exit 1; }
+    for want in 'Content-Length: ' '"id":1' '"documentFormattingProvider":true'; do
+      grep -Fq "$want" lsp.out || { echo "expected $want in the response, got:" >&2; cat lsp.out lsp.err >&2; exit 1; }
+    done
+examples:
+  - title: Format the TOML files in the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/tombi format
+  - title: Check the formatting without changing files
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/tombi format --check
+  - title: Lint the TOML files without network access
+    command: docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/tombi lint --offline
+  - title: Format TOML from stdin
+    command: echo 'a=1' | docker run --rm -i ghcr.io/randomcontainers/tombi format -
