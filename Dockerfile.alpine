@@ -1,0 +1,206 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS rust
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+# GNU tar unpacks the Rust archives, which use GNU long names.
+RUN apk add --no-cache \
+      build-base \
+      ca-certificates \
+      curl \
+      git \
+      gpgv \
+      python3 \
+      scanelf \
+      tar \
+      xz
+
+# Rust comes from static.rust-lang.org instead of the distro, so that both
+# distros build with the same release. The release manifest is pinned in
+# package.yml and signed with the Rust release key, fingerprint
+# 108F 6620 5EAE B0AA A8DD 5E1C 85AB 96E6 FA1B E5FE; it lists the SHA-256 of
+# every archive that rust-toolchain.sh installs.
+ARG RUST_TOOLCHAIN_VERSION
+ARG RUST_TOOLCHAIN_SHA256
+ADD --checksum=sha256:${RUST_TOOLCHAIN_SHA256} https://static.rust-lang.org/dist/channel-rust-${RUST_TOOLCHAIN_VERSION}.toml /tmp/rust/
+ADD https://static.rust-lang.org/dist/channel-rust-${RUST_TOOLCHAIN_VERSION}.toml.asc /tmp/rust/
+COPY keys/rust.gpg /tmp/rust.gpg
+ARG TARGETARCH
+RUN --mount=type=bind,source=scripts/rust-toolchain.sh,target=/tmp/rust-toolchain.sh \
+    case "${TARGETARCH}" in \
+      amd64) arch=x86_64 ;; \
+      arm64) arch=aarch64 ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    manifest="/tmp/rust/channel-rust-${RUST_TOOLCHAIN_VERSION}.toml"; \
+    gpgv --keyring /tmp/rust.gpg "${manifest}.asc" "$manifest"; \
+    sh /tmp/rust-toolchain.sh "$manifest" "${RUST_TOOLCHAIN_VERSION}" "${arch}-unknown-linux-musl" \
+      /opt/rust /opt/rust-src > /tmp/rust-toolchain
+# Rust links musl programs statically by default, with its own copy of musl
+# and LLVM's libunwind. -crt-static links Alpine's musl and libgcc_s instead,
+# so that musl fixes reach tombi through the base image. RUSTFLAGS takes the
+# place of any rustflags in upstream's cargo configuration.
+ENV PATH=/opt/rust/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CARGO_HOME=/opt/cargo \
+    CARGO_INCREMENTAL=0 \
+    CARGO_NET_RETRY=5 \
+    CARGO_TERM_COLOR=never \
+    RUSTFLAGS="-C target-feature=-crt-static"
+
+# cargo-auditable is built from its crate, with the crates in its Cargo.lock.
+# It runs only in the build stage below. hadolint does not carry SHELL from
+# one stage into the next, so each stage repeats it.
+FROM rust AS auditable
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+ARG CARGO_AUDITABLE_VERSION
+ARG CARGO_AUDITABLE_SHA256
+ADD --checksum=sha256:${CARGO_AUDITABLE_SHA256} https://static.crates.io/crates/cargo-auditable/cargo-auditable-${CARGO_AUDITABLE_VERSION}.crate /tmp/
+RUN mkdir /src; \
+    tar -xzf "/tmp/cargo-auditable-${CARGO_AUDITABLE_VERSION}.crate" -C /src; \
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')" \
+      --manifest-path "/src/cargo-auditable-${CARGO_AUDITABLE_VERSION}/Cargo.toml"
+ARG JOBS
+RUN --network=none \
+    cargo install --frozen --root /opt/cargo-auditable -j "${JOBS:-$(nproc)}" \
+      --path "/src/cargo-auditable-${CARGO_AUDITABLE_VERSION}"
+
+FROM rust AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+# tombi publishes no source tarball, so the release tag is cloned and must
+# point to the commit pinned in package.yml. The clone keeps its .git
+# directory: tombi's build script takes the version that tombi reports from
+# the release tag at HEAD.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/tombi-toml/tombi.git /src/tombi; \
+    test "$(git -C /src/tombi rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    git -C /src/tombi tag --points-at HEAD > /tmp/tags; \
+    grep -Fqx "v${VERSION}" /tmp/tags || { echo "the clone has no tag v${VERSION} at HEAD" >&2; exit 1; }
+WORKDIR /src/tombi
+# Upstream's .cargo/config.toml applies to this build. It sets nothing for
+# Linux today; a change stops the build until it has been read and its new
+# SHA-256 is in cargo-config.sha256. cargo fetch then downloads the crates in
+# Cargo.lock for this platform and checks each against its checksum there.
+# The workspace version in Cargo.toml is a placeholder, 0.0.0-dev, which
+# upstream's release workflow rewrites before it builds; this build leaves
+# Cargo.toml and Cargo.lock as they are at the tag.
+RUN --mount=type=bind,source=cargo-config.sha256,target=/tmp/cargo-config.sha256 \
+    if [ -e .cargo/config ]; then echo "upstream ships .cargo/config, which this build does not check" >&2; exit 1; fi; \
+    if [ -f .cargo/config.toml ]; then \
+      test -f /tmp/cargo-config.sha256 \
+        || { cat .cargo/config.toml >&2; echo "upstream added .cargo/config.toml: read it, then pin it in cargo-config.sha256" >&2; exit 1; }; \
+      sha256sum -c /tmp/cargo-config.sha256 \
+        || { cat .cargo/config.toml >&2; echo "upstream changed .cargo/config.toml: read it, then pin it again" >&2; exit 1; }; \
+    elif [ -f /tmp/cargo-config.sha256 ]; then \
+      echo "cargo-config.sha256 pins a file that upstream no longer ships" >&2; exit 1; \
+    fi; \
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"; \
+    cargo pkgid --frozen -p tombi-cli > /tmp/pkgid; \
+    case "$(cat /tmp/pkgid)" in \
+      *"#0.0.0-dev" | *"@0.0.0-dev" | *"#${VERSION}" | *"@${VERSION}") ;; \
+      *) echo "tombi-cli is neither 0.0.0-dev nor ${VERSION}: $(cat /tmp/pkgid)" >&2; exit 1 ;; \
+    esac
+
+# The build has no network: it reads only the crates fetched above.
+# cargo-auditable stores the list of crates in the binary's .dep-v0 section,
+# where SBOM tools and image scanners find it. The workspace has no release
+# profile of its own, so cargo's default applies; upstream's release workflow
+# adds fat LTO and strips symbols through the environment, which this build
+# does not do. --version prints the version and the target, and shows that
+# the build script found the release tag.
+COPY --link --from=auditable /opt/cargo-auditable/bin/cargo-auditable /opt/rust/bin/
+ARG JOBS
+RUN --network=none \
+    cargo auditable build --frozen --release -p tombi-cli --bin tombi -j "${JOBS:-$(nproc)}"; \
+    install -D -m 755 target/release/tombi /out/usr/local/bin/tombi; \
+    bin=/out/usr/local/bin/tombi; \
+    host="$(rustc -vV | sed -n 's/^host: //p')"; \
+    "$bin" --version > /tmp/tombi-version; \
+    test "$(cat /tmp/tombi-version)" = "tombi ${VERSION} (${host})" \
+      || { echo "expected tombi ${VERSION} (${host}), got: $(cat /tmp/tombi-version)" >&2; exit 1; }; \
+    readelf -hlSW "$bin" > /tmp/tombi-elf; \
+    grep -Eq '^ *Type: +DYN ' /tmp/tombi-elf || { cat /tmp/tombi-elf >&2; exit 1; }; \
+    grep -Fq '[Requesting program interpreter: /lib/ld-musl-' /tmp/tombi-elf \
+      || { echo "tombi is not linked against Alpine's musl" >&2; exit 1; }; \
+    grep -Fq ' .dep-v0 ' /tmp/tombi-elf || { echo "tombi has no cargo-auditable data" >&2; exit 1; }
+
+ARG BASE_IMAGE
+ARG RUST_TOOLCHAIN_VERSION
+ARG CARGO_AUDITABLE_VERSION
+ARG CARGO_AUDITABLE_SHA256
+# tombi's license file comes from the tag. tombi embeds copies of the
+# SchemaStore schemas for Cargo.toml and pyproject.toml, whose license and
+# notice are in licenses/schemastore. cargo-licenses.py copies the license
+# files of every crate that the binary records and of the Rust standard
+# library, copies the MPL-2.0 crates to crate-sources, and stops when a
+# crate's license is not covered by package.yml's license. licenses/crates
+# holds the texts that crates do not ship and the notice of the Public Suffix
+# List in psl. runtime-deps lists the so: names tombi needs, plus the packages
+# in runtime-deps.alpine.
+RUN --network=none \
+    --mount=type=bind,source=scripts/cargo-licenses.py,target=/tmp/cargo-licenses.py \
+    --mount=type=bind,source=licenses,target=/tmp/licenses \
+    --mount=type=bind,source=package.yml,target=/tmp/package.yml \
+    --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    meta=/out/usr/local/share/randomcontainers/tombi; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/"; \
+    for f in cargo.json pyproject.json; do \
+      test -f "www.schemastore.org/$f" \
+        || { echo "tombi no longer embeds www.schemastore.org/$f: check licenses/schemastore" >&2; exit 1; }; \
+    done; \
+    cp -R /tmp/licenses/schemastore "$meta/licenses/"; \
+    python3 -I /tmp/cargo-licenses.py \
+      --binary /out/usr/local/bin/tombi --workspace /src/tombi --package-yml /tmp/package.yml \
+      --extra /tmp/licenses/crates --rust-src /opt/rust-src \
+      --licenses "$meta/licenses" --sources "$meta/crate-sources" > /tmp/crates; \
+    echo "${VERSION}" > "$meta/version"; \
+    { \
+      echo "https://github.com/tombi-toml/tombi.git@${SOURCE_COMMIT}"; \
+      echo "https://github.com/tombi-toml/tombi/tree/${SOURCE_COMMIT}"; \
+      echo "https://static.rust-lang.org/dist/channel-rust-${RUST_TOOLCHAIN_VERSION}.toml"; \
+      sed -n 's/^rust-src: \([^ ]*\) .*$/\1/p' /tmp/rust-toolchain; \
+      echo "https://static.crates.io/crates/cargo-auditable/cargo-auditable-${CARGO_AUDITABLE_VERSION}.crate"; \
+      sed -n 's/^source: //p' /tmp/crates; \
+    } > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "rust: ${RUST_TOOLCHAIN_VERSION}"; \
+      cat /tmp/rust-toolchain; \
+      rustc -vV; \
+      echo "linker: $(cc --version | sed -n 1p)"; \
+      echo "cargo-auditable: ${CARGO_AUDITABLE_VERSION} ${CARGO_AUDITABLE_SHA256}"; \
+      echo "rustflags: ${RUSTFLAGS:-}"; \
+      cat /tmp/tombi-version; \
+      echo "crates:"; \
+      sed -n 's/^crate: /  /p' /tmp/crates; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | sort -u > /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    test -s /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/tombi/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "tombi"]
+CMD ["--help"]
