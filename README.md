@@ -197,7 +197,7 @@ Rust comes from static.rust-lang.org. The release manifest named in `package.yml
 
 The project checks the releases of [tombi-toml/tombi](https://github.com/tombi-toml/tombi/releases) every 15 minutes. A release is picked up once it is 48 hours old, and at most once a week: while the release in `package.yml` is less than 7 days old, newer releases wait, and then the newest release that is 48 hours old is taken and those in between are skipped. The new version and the commit of its tag are committed to `package.yml` and the images are rebuilt. Only the newest release is built; tags of older versions stay as they were last built.
 
-The Rust release that builds tombi follows Rust's stable channel. Each new stable release is committed to `package.yml` once it is 7 days old, and the images are rebuilt with it. cargo-auditable is pinned by hand. Tombi declares no minimum Rust version and builds its releases with the newest stable Rust, so a Tombi release can need a newer Rust than the pinned one. It then does not build until the pin moves.
+The Rust release that builds tombi follows Rust's stable channel. Each new stable release is committed to `package.yml` once it is a day old, and the images are rebuilt with it. cargo-auditable is pinned by hand. Tombi declares no minimum Rust version and builds its releases with the newest stable Rust, so a Tombi release can need a newer Rust than the pinned one. It then does not build until the pin moves.
 
 A release also waits for a person to update this repository when it:
 
