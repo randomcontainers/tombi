@@ -28,7 +28,7 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 1.9.9
+  version: 1.10.0
   # tombi often releases several times a week, and hotfixes follow within a
   # day or two. A release is taken once it is 48 hours old, and at most one a
   # week.
@@ -39,7 +39,7 @@ upstream:
   git:
     url: https://github.com/tombi-toml/tombi.git
     tag: v{version}
-    commit: 5a17ef0e20492e21efa5549fbf382c8142c17ec4
+    commit: 392432a316fbe50e600f1c1901e13bae3e284ecf
   extra-artifacts:
     # The Rust release manifest, signed with the Rust release key. The build
     # installs rustc, cargo, rust-std and rust-src from the archives it lists,
